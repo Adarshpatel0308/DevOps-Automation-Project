@@ -7,12 +7,12 @@ export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -y
 sudo apt-get install -y ca-certificates curl git unzip gnupg openjdk-17-jre
 
-# Jenkins repo + key (GPG keyring — Ubuntu recommended)
+# Jenkins repo + key (GPG keyring — Ubuntu recommended; use debian-stable)
 sudo install -m 0755 -d /usr/share/keyrings
-curl -fsSL https://pkg.jenkins.io/debian/jenkins.io-2023.key \
+curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key \
   | sudo gpg --dearmor -o /usr/share/keyrings/jenkins-keyring.gpg
 
-echo "deb [signed-by=/usr/share/keyrings/jenkins-keyring.gpg] https://pkg.jenkins.io/debian binary/" \
+echo "deb [signed-by=/usr/share/keyrings/jenkins-keyring.gpg] https://pkg.jenkins.io/debian-stable binary/" \
   | sudo tee /etc/apt/sources.list.d/jenkins.list > /dev/null
 
 sudo apt-get update -y
@@ -29,21 +29,20 @@ sudo ./aws/install
 aws --version || true
 
 # kubectl (latest stable)
-KVER=$(curl -L -s https://dl.k8s.io/release/stable.txt)
+KVER="$(curl -L -s https://dl.k8s.io/release/stable.txt)"
 curl -fsSL "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl" -o kubectl
 chmod +x kubectl
 sudo mv kubectl /usr/local/bin/
 kubectl version --client=true || true
 
-# Allow 8080 if ufw present (usually disabled)
+# Allow 8080 if ufw present (usually disabled on Ubuntu cloud images)
 if command -v ufw >/dev/null 2>&1; then
   sudo ufw allow 8080/tcp || true
 fi
 
-# Print Jenkins admin password (sanity)
+# Print Jenkins admin password (sanity check)
 if [ -f /var/lib/jenkins/secrets/initialAdminPassword ]; then
   sudo cat /var/lib/jenkins/secrets/initialAdminPassword || true
 fi
 
 echo "Bootstrap complete."
-``
