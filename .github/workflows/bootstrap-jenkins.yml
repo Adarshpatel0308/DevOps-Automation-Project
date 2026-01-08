@@ -53,18 +53,78 @@ jobs:
         path: jenkins-keypair.pem
         if-no-files-found: ignore
 
-    - name: Create Security Group
+    
+    - name: Ensure Security Group (idempotent)
+      shell: bash
+      env:
+        SG_NAME: ${{ env.SECURITY_GROUP_NAME }}
+        J_PORT: ${{ env.JENKINS_PORT }}
+        REGION: ${{ env.AWS_REGION }}
       run: |
-        SG_ID=$(aws ec2 create-security-group \
-          --group-name "$SECURITY_GROUP_NAME" \
-          --description "Security group for Jenkins Master" \
-          --query 'GroupId' --output text)
-        echo "SG_ID=$SG_ID" >> $GITHUB_ENV
+        set -euo pipefail
 
-        aws ec2 authorize-security-group-ingress --group-id "$SG_ID" \
-          --protocol tcp --port 22 --cidr 0.0.0.0/0
-        aws ec2 authorize-security-group-ingress --group-id "$SG_ID" \
-          --protocol tcp --port $JENKINS_PORT --cidr 0.0.0.0/0
+        # (1) Resolve VPC ID: use provided VPC_ID if set; else get default VPC
+        if [[ -n "${VPC_ID:-}" ]]; then
+          VPC="${VIC_ID}"
+        else
+          VPC=$(aws ec2 describe-vpcs \
+            --filters "Name=isDefault,Values=true" \
+            --query "Vpcs[0].VpcId" --output text --region "${REGION}")
+          if [[ "${VPC}" == "None" || -z "${VPC}" ]]; then
+            echo "ERROR: No default VPC found. Set env VPC_ID to your target VPC."
+            exit 1
+          fi
+        fi
+        echo "Using VPC: ${VPC}"
+
+        # (2) Try to find existing SG by name within that VPC
+        SG_ID=$(aws ec2 describe-security-groups \
+          --filters "Name=vpc-id,Values=${VPC}" "Name=group-name,Values=${SG_NAME}" \
+          --query "SecurityGroups[0].GroupId" --output text --region "${REGION}" || true)
+
+        if [[ -n "${SG_ID}" && "${SG_ID}" != "None" ]]; then
+          echo "Security Group already exists: ${SG_ID}"
+        else
+          echo "Creating Security Group: ${SG_NAME} in ${VPC}"
+          SG_ID=$(aws ec2 create-security-group \
+            --group-name "${SG_NAME}" \
+            --description "Security group for Jenkins Master" \
+            --vpc-id "${VPC}" \
+            --query 'GroupId' --output text --region "${REGION}")
+          echo "Created SG: ${SG_ID}"
+        fi
+
+        # Export for next steps
+        echo "SG_ID=${SG_ID}" >> $GITHUB_ENV
+
+        # (3) Ensure ingress rules (22 and Jenkins port). Avoid duplicates.
+        # Helper: function to check if rule exists
+        has_rule() {
+          local PORT="$1"
+          local COUNT
+          COUNT=$(aws ec2 describe-security-groups \
+            --group-ids "${SG_ID}" --region "${REGION}" \
+            --query "SecurityGroups[0].IpPermissions[?FromPort==\`${PORT}\` && ToPort==\`${PORT}\` && IpProtocol=='tcp'].length(@)" \
+            --output text)
+          [[ "${COUNT}" == "1" ]]
+        }
+
+        if has_rule 22; then
+          echo "Ingress for port 22 already present."
+        else
+          aws ec2 authorize-security-group-ingress \
+            --group-id "${SG_ID}" --protocol tcp --port 22 --cidr 0.0.0.0/0 --region "${REGION}"
+          echo "Added ingress: 22/tcp"
+        fi
+
+        if has_rule "${J_PORT}"; then
+          echo "Ingress for port ${J_PORT} already present."
+        else
+          aws ec2 authorize-security-group-ingress \
+            --group-id "${SG_ID}" --protocol tcp --port "${J_PORT}" --cidr 0.0.0.0/0 --region "${REGION}"
+          echo "Added ingress: ${J_PORT}/tcp"
+        fi
+
 
     - name: Create Jenkins EC2 Instance
       run: |
