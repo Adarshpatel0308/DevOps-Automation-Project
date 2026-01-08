@@ -1,8 +1,7 @@
 
-# .github/workflows/bootstrap-jenkins.yml
-
 name: Bootstrap Jenkins Master
-on: { workflow_dispatch: {} }
+on:
+  workflow_dispatch: {}
 
 permissions:
   id-token: write
@@ -13,148 +12,163 @@ env:
   INSTANCE_TYPE: t3.medium
   SECURITY_GROUP_NAME: jenkins-master-sg
   KEY_NAME: jenkins-keypair
-  AMI_ID: ami-08c40ec9ead489470
+  AMI_ID: ami-08c40ec9ead489470   # Ubuntu 22.04 LTS (us-east-1)
   JENKINS_PORT: 8080
+  # Optional: set your known VPC to avoid default VPC detection ambiguity
+  # VPC_ID: vpc-04e3313d6a32d3ccc
 
 jobs:
   create-jenkins-master:
     runs-on: ubuntu-latest
+
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-    - name: Ensure or Create Key Pair
-      shell: bash
-      run: |
-        set -e
-        echo "Checking key pair: ${KEY_NAME} in region ${AWS_REGION}"
-        if aws ec2 describe-key-pairs --key-names "${KEY_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1; then
-          echo "Key pair ${KEY_NAME} already exists."
-        else
-          echo "Key pair ${KEY_NAME} not found. Creating..."
-          aws ec2 create-key-pair --key-name "${KEY_NAME}" --region "${AWS_REGION}" \
-            --query 'KeyMaterial' --output text > "${KEY_NAME}.pem"
-          chmod 400 "${KEY_NAME}.pem"
-          echo "Key pair created and saved as ${KEY_NAME}.pem"
-        fi
+      - name: Ensure or Create Key Pair
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Checking key pair: ${KEY_NAME} in region ${AWS_REGION}"
+          if aws ec2 describe-key-pairs --key-names "${KEY_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+            echo "Key pair ${KEY_NAME} already exists."
+          else
+            echo "Key pair ${KEY_NAME} not found. Creating..."
+            aws ec2 create-key-pair --key-name "${KEY_NAME}" --region "${AWS_REGION}" \
+              --query 'KeyMaterial' --output text > "${KEY_NAME}.pem"
+            chmod 400 "${KEY_NAME}.pem"
+            echo "Key pair created and saved as ${KEY_NAME}.pem"
+          fi
 
-    - name: Upload Key Pair as Artifact (for SSH later)
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: jenkins-keypair-pem
-        path: jenkins-keypair.pem
-        if-no-files-found: ignore
+      - name: Upload Key Pair as Artifact (for SSH later)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jenkins-keypair-pem
+          path: jenkins-keypair.pem
+          if-no-files-found: ignore
 
-    
-    - name: Ensure Security Group (idempotent)
-      shell: bash
-      env:
-        SG_NAME: ${{ env.SECURITY_GROUP_NAME }}
-        J_PORT: ${{ env.JENKINS_PORT }}
-        REGION: ${{ env.AWS_REGION }}
-      run: |
-        set -euo pipefail
+      - name: Resolve VPC (default or provided)
+        id: vpc
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${VPC_ID:-}" ]]; then
+            VPC="${VPC_ID}"     # ✅ correct variable
+          else
+            VPC=$(aws ec2 describe-vpcs \
+              --filters "Name=isDefault,Values=true" \
+              --query "Vpcs[0].VpcId" --output text --region "${AWS_REGION}")
+            if [[ "${VPC}" == "None" || -z "${VPC}" ]]; then
+              echo "ERROR: No default VPC found. Set env VPC_ID to your target VPC."
+              exit 1
+            fi
+          fi
+          echo "VPC=${VPC}" >> $GITHUB_ENV
+          echo "Using VPC: ${VPC}"
 
-        # (1) Resolve VPC ID: use provided VPC_ID if set; else get default VPC
-        if [[ -n "${VPC_ID:-}" ]]; then
-          VPC="${VIC_ID}"
-        else
-          VPC=$(aws ec2 describe-vpcs \
-            --filters "Name=isDefault,Values=true" \
-            --query "Vpcs[0].VpcId" --output text --region "${REGION}")
-          if [[ "${VPC}" == "None" || -z "${VPC}" ]]; then
-            echo "ERROR: No default VPC found. Set env VPC_ID to your target VPC."
+      - name: Ensure Security Group (idempotent + duplicate-tolerant)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SG_NAME="${SECURITY_GROUP_NAME}"
+          REGION="${AWS_REGION}"
+          VPC="${VPC}"
+
+          # Find existing SG by name in VPC
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=vpc-id,Values=${VPC}" "Name=group-name,Values=${SG_NAME}" \
+            --query "SecurityGroups[0].GroupId" --output text --region "${REGION}" || true)
+
+          if [[ -n "${SG_ID}" && "${SG_ID}" != "None" ]]; then
+            echo "Security Group already exists: ${SG_ID}"
+          else
+            echo "Creating Security Group: ${SG_NAME} in ${VPC}"
+            SG_ID=$(aws ec2 create-security-group \
+              --group-name "${SG_NAME}" \
+              --description "Security group for Jenkins Master" \
+              --vpc-id "${VPC}" \
+              --query 'GroupId' --output text --region "${REGION}")
+            echo "Created SG: ${SG_ID}"
+          fi
+
+          echo "SG_ID=${SG_ID}" >> $GITHUB_ENV
+
+          # Add ingress (duplicate-tolerant). AWS may throw Duplicate; ignore and continue.
+          aws ec2 authorize-security-group-ingress \
+            --group-id "${SG_ID}" --protocol tcp --port 22 --cidr 0.0.0.0/0 --region "${REGION}" \
+            >/dev/null 2>&1 || echo "Ingress 22/tcp already present."
+
+          aws ec2 authorize-security-group-ingress \
+            --group-id "${SG_ID}" --protocol tcp --port "${JENKINS_PORT}" --cidr 0.0.0.0/0 --region "${REGION}" \
+            >/dev/null 2>&1 || echo "Ingress ${JENKINS_PORT}/tcp already present."
+
+      - name: Find a public subnet in VPC (auto)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Pick first subnet with MapPublicIpOnLaunch=true
+          SUBNET_ID=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=${VPC}" \
+            --query "Subnets[?MapPublicIpOnLaunch==\`true\`].[SubnetId]" \
+            --output text --region "${AWS_REGION}" | head -n1)
+
+          if [[ -z "${SUBNET_ID}" || "${SUBNET_ID}" == "None" ]]; then
+            echo "ERROR: No public subnet found in VPC ${VPC}. Provide SUBNET_ID env."
             exit 1
           fi
-        fi
-        echo "Using VPC: ${VPC}"
 
-        # (2) Try to find existing SG by name within that VPC
-        SG_ID=$(aws ec2 describe-security-groups \
-          --filters "Name=vpc-id,Values=${VPC}" "Name=group-name,Values=${SG_NAME}" \
-          --query "SecurityGroups[0].GroupId" --output text --region "${REGION}" || true)
+          echo "SUBNET_ID=${SUBNET_ID}" >> $GITHUB_ENV
+          echo "Using Subnet: ${SUBNET_ID}"
 
-        if [[ -n "${SG_ID}" && "${SG_ID}" != "None" ]]; then
-          echo "Security Group already exists: ${SG_ID}"
-        else
-          echo "Creating Security Group: ${SG_NAME} in ${VPC}"
-          SG_ID=$(aws ec2 create-security-group \
-            --group-name "${SG_NAME}" \
-            --description "Security group for Jenkins Master" \
-            --vpc-id "${VPC}" \
-            --query 'GroupId' --output text --region "${REGION}")
-          echo "Created SG: ${SG_ID}"
-        fi
-
-        # Export for next steps
-        echo "SG_ID=${SG_ID}" >> $GITHUB_ENV
-
-        # (3) Ensure ingress rules (22 and Jenkins port). Avoid duplicates.
-        # Helper: function to check if rule exists
-        has_rule() {
-          local PORT="$1"
-          local COUNT
-          COUNT=$(aws ec2 describe-security-groups \
-            --group-ids "${SG_ID}" --region "${REGION}" \
-            --query "SecurityGroups[0].IpPermissions[?FromPort==\`${PORT}\` && ToPort==\`${PORT}\` && IpProtocol=='tcp'].length(@)" \
+      - name: Create Jenkins EC2 Instance
+        shell: bash
+        run: |
+          set -euo pipefail
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id "$AMI_ID" \
+            --count 1 \
+            --instance-type "$INSTANCE_TYPE" \
+            --key-name "$KEY_NAME" \
+            --security-group-ids "$SG_ID" \
+            --subnet-id "$SUBNET_ID" \
+            --associate-public-ip-address \
+            --user-data file://scripts/install-jenkins.sh \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=Jenkins-Master}]' \
+            --query 'Instances[0].InstanceId' \
             --output text)
-          [[ "${COUNT}" == "1" ]]
-        }
+          echo "INSTANCE_ID=${INSTANCE_ID}" >> $GITHUB_ENV
+          echo "Created EC2: ${INSTANCE_ID}"
 
-        if has_rule 22; then
-          echo "Ingress for port 22 already present."
-        else
-          aws ec2 authorize-security-group-ingress \
-            --group-id "${SG_ID}" --protocol tcp --port 22 --cidr 0.0.0.0/0 --region "${REGION}"
-          echo "Added ingress: 22/tcp"
-        fi
+      - name: Wait for EC2 Running State
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ec2 wait instance-running --instance-ids "${INSTANCE_ID}"
+          echo "Instance is running."
 
-        if has_rule "${J_PORT}"; then
-          echo "Ingress for port ${J_PORT} already present."
-        else
-          aws ec2 authorize-security-group-ingress \
-            --group-id "${SG_ID}" --protocol tcp --port "${J_PORT}" --cidr 0.0.0.0/0 --region "${REGION}"
-          echo "Added ingress: ${J_PORT}/tcp"
-        fi
+      - name: Get Public IP
+        shell: bash
+        run: |
+          set -euo pipefail
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids "${INSTANCE_ID}" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --output text)
+          echo "PUBLIC_IP=${PUBLIC_IP}" >> $GITHUB_ENV
+          echo "Jenkins URL: http://${PUBLIC_IP}:${JENKINS_PORT}"
 
-
-    - name: Create Jenkins EC2 Instance
-      run: |
-        INSTANCE_ID=$(aws ec2 run-instances \
-          --image-id "$AMI_ID" \
-          --count 1 \
-          --instance-type "$INSTANCE_TYPE" \
-          --key-name "$KEY_NAME" \
-          --security-group-ids "$SG_ID" \
-          --user-data file://scripts/install-jenkins.sh \
-          --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=Jenkins-Master}]' \
-          --query 'Instances[0].InstanceId' \
-          --output text)
-        echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
-
-    - name: Wait for EC2 Running State
-      run: aws ec2 wait instance-running --instance-ids ${{ env.INSTANCE_ID }}
-
-    - name: Get Public IP
-      run: |
-        PUBLIC_IP=$(aws ec2 describe-instances \
-          --instance-ids ${{ env.INSTANCE_ID }} \
-          --query "Reservations[0].Instances[0].PublicIpAddress" \
-          --output text)
-        echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
-        echo "Jenkins URL: http://$PUBLIC_IP:$JENKINS_PORT"
-
-    - name: Output Jenkins URL
-      run: |
-        echo "========================================"
-        echo "JENKINS MASTER READY"
-        echo "URL => http://${{ env.PUBLIC_IP }}:${{ env.JENKINS_PORT }}"
-        echo "========================================"
+      - name: Output Jenkins URL
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "JENKINS MASTER READY"
+          echo "URL => http://${PUBLIC_IP}:${JENKINS_PORT}"
+          echo "========================================"
