@@ -1,0 +1,152 @@
+
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION          = "us-east-1"
+        AMI_ID              = "ami-08c40ec9ead489470"   // Ubuntu 22.04 LTS
+        INSTANCE_TYPE       = "t3.micro"
+        SG_NAME             = "ansible-controller-sg"
+        KEY_NAME            = "jenkins-keypair"         // Must exist in AWS
+        SSH_CIDR            = "0.0.0.0/0"                // Can tighten later
+        LINUX_USER          = "ubuntu"
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps { checkout scm }
+        }
+
+        stage('Create Security Group') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'aws_access_key_id', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'aws_secret_access_key', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        set -e
+                        
+                        VPC_ID=$(aws ec2 describe-vpcs \
+                          --filters "Name=isDefault,Values=true" \
+                          --query "Vpcs[0].VpcId" \
+                          --region "${AWS_REGION}" \
+                          --output text)
+
+                        echo "Detected VPC: $VPC_ID"
+
+                        SG_ID=$(aws ec2 describe-security-groups \
+                           --filters "Name=vpc-id,Values=$VPC_ID" "Name=group-name,Values=${SG_NAME}" \
+                           --query "SecurityGroups[0].GroupId" \
+                           --region "${AWS_REGION}" \
+                           --output text || true)
+
+                        if [[ "$SG_ID" == "None" || -z "$SG_ID" ]]; then
+                            SG_ID=$(aws ec2 create-security-group \
+                                --group-name "${SG_NAME}" \
+                                --description "SG for Ansible controller" \
+                                --vpc-id "$VPC_ID" \
+                                --query "GroupId" \
+                                --region "${AWS_REGION}" \
+                                --output text)
+                        fi
+
+                        echo "SG_ID=${SG_ID}" > sg.env
+
+                        aws ec2 authorize-security-group-ingress \
+                            --group-id "$SG_ID" --protocol tcp --port 22 \
+                            --cidr "${SSH_CIDR}" --region "${AWS_REGION}" >/dev/null 2>&1 || true
+                    '''
+                }
+            }
+        }
+
+        stage('Launch Ansible Controller EC2') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'aws_access_key_id', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'aws_secret_access_key', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        set -e
+                        source sg.env
+
+                        SUBNET=$(aws ec2 describe-subnets \
+                          --filters "Name=vpc-id,Values=$(aws ec2 describe-vpcs --filters 'Name=isDefault,Values=true' --query 'Vpcs[0].VpcId' --region ${AWS_REGION} --output text)" \
+                          --query "Subnets[?MapPublicIpOnLaunch==\\`true\\`].[SubnetId]" \
+                          --output text \
+                          --region "${AWS_REGION}" | head -1)
+
+                        INSTANCE_ID=$(aws ec2 run-instances \
+                          --image-id "${AMI_ID}" \
+                          --count 1 \
+                          --instance-type "${INSTANCE_TYPE}" \
+                          --key-name "${KEY_NAME}" \
+                          --security-group-ids "${SG_ID}" \
+                          --subnet-id "$SUBNET" \
+                          --associate-public-ip-address \
+                          --query "Instances[0].InstanceId" \
+                          --output text \
+                          --region "${AWS_REGION}")
+
+                        echo "INSTANCE_ID=${INSTANCE_ID}" > instance.env
+
+                        aws ec2 wait instance-running --instance-ids "${INSTANCE_ID}" --region "${AWS_REGION}"
+
+                        PUBLIC_IP=$(aws ec2 describe-instances \
+                          --instance-ids "${INSTANCE_ID}" \
+                          --region "${AWS_REGION}" \
+                          --query "Reservations[0].Instances[0].PublicIpAddress" \
+                          --output text)
+
+                        echo "PUBLIC_IP=${PUBLIC_IP}" >> instance.env
+                    '''
+                }
+            }
+        }
+
+        stage('Install Ansible on Controller') {
+            steps {
+                withCredentials([
+                    sshUserPrivateKey(credentialsId: 'aws-ssh-key', keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')
+                ]) {
+                    sh '''
+                        set -e
+                        source instance.env
+
+                        HOST="${SSH_USER}@${PUBLIC_IP}"
+                        SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
+
+                        # wait for ssh
+                        for i in {1..20}; do
+                          ssh $SSH_OPTS -i "$SSH_KEY" "$HOST" "echo OK" && break
+                          sleep 10
+                        done
+
+                        ssh $SSH_OPTS -i "$SSH_KEY" "$HOST" "sudo apt-get update -y && sudo apt-get install -y ansible"
+                    '''
+                }
+            }
+        }
+
+        stage('Output Instance Info') {
+            steps {
+                sh '''
+                    source instance.env
+                    echo "============================================="
+                    echo " Ansible Controller Instance Ready"
+                    echo " Public IP : ${PUBLIC_IP}"
+                    echo " SSH Cmd   : ssh -i <pem_path> ubuntu@${PUBLIC_IP}"
+                    echo "============================================="
+                '''
+            }
+        }
+
+    } // stages
+
+    post {
+        always {
+            echo "Pipeline Completed."
+        }
+    }
+}

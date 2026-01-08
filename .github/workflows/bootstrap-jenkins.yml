@@ -160,7 +160,8 @@ jobs:
           echo "PUBLIC_IP=${PUBLIC_IP}" >> $GITHUB_ENV
           echo "Public IP: ${PUBLIC_IP}"
 
-      - name: SSH bootstrap installer (retry until SSH ready)
+      
+      - name: SSH bootstrap installer (copy installer + PEM + run with env)
         shell: bash
         run: |
           set -euo pipefail
@@ -169,19 +170,31 @@ jobs:
           HOST="ubuntu@${PUBLIC_IP}"
           SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
 
-          # Retry loop for SSH availability
+          # wait for SSH
           for i in {1..20}; do
-            echo "Attempt $i: checking SSH..."
-            if ssh ${SSH_OPTS} -i "${PEM}" "${HOST}" "echo SSH OK"; then
-              break
-            fi
+            if ssh ${SSH_OPTS} -i "${PEM}" "${HOST}" "echo SSH OK"; then break; fi
             sleep 10
           done
 
-          echo "Copying installer..."
+          REPO_URL="https://github.com/${GITHUB_REPOSITORY}.git"
+          REPO_BRANCH="${GITHUB_REF_NAME:-main}"
+          JOB_NAME="main-pipeline"
+
+          echo "Copying installer + PEM..."
           scp ${SSH_OPTS} -i "${PEM}" scripts/install-jenkins.sh "${HOST}:/home/ubuntu/install-jenkins.sh"
-          echo "Running installer..."
-          ssh ${SSH_OPTS} -i "${PEM}" "${HOST}" "sudo bash /home/ubuntu/install-jenkins.sh"
+          scp ${SSH_OPTS} -i "${PEM}" "${PEM}" "${HOST}:/home/ubuntu/aws_key.pem"
+
+          echo "Running installer with env"
+          ssh ${SSH_OPTS} -i "${PEM}" "${HOST}" " \
+            ADMIN_USER='adarsh' \
+            ADMIN_PASS='88899' \
+            REPO_URL='${REPO_URL}' \
+            REPO_BRANCH='${REPO_BRANCH}' \
+            JOB_NAME='${JOB_NAME}' \
+            SSH_KEY_PATH='/home/ubuntu/aws_key.pem' \
+            sudo -E bash /home/ubuntu/install-jenkins.sh \
+          "
+
 
       - name: Verify Jenkins service & print admin password
         shell: bash

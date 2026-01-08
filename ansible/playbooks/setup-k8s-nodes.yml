@@ -1,0 +1,87 @@
+
+---
+- name: Setup Docker + Minikube + Kubectl on all k8s nodes
+  hosts: k8s_nodes
+  become: true
+  vars:
+    minikube_version: "v1.33.1"     # stable as of late 2025
+    kubernetes_version: ""          # empty = latest
+    node_port: 30080
+  tasks:
+    - name: Disable swap (required)
+      command: swapoff -a
+      ignore_errors: true
+
+    - name: Remove swap from fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^\s*[^#].*\sswap\s'
+        replace: '# swap disabled'
+      notify: Reboot if needed
+      ignore_errors: true
+
+    - name: Install prerequisites
+      apt:
+        name:
+          - ca-certificates
+          - curl
+          - git
+          - conntrack
+          - socat
+          - ebtables
+          - iptables
+          - iproute2
+          - gnupg
+        state: present
+        update_cache: yes
+
+    - name: Install Docker
+      apt:
+        name:
+          - docker.io
+        state: present
+      notify: Restart docker
+
+    - name: Add ubuntu to docker group
+      user:
+        name: ubuntu
+        groups: docker
+        append: yes
+
+    - name: Install kubectl (latest stable)
+      shell: |
+        set -e
+        KVER="$(curl -L -s https://dl.k8s.io/release/stable.txt)"
+        curl -fsSL "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
+        chmod +x /usr/local/bin/kubectl
+      args:
+        executable: /bin/bash
+
+    - name: Install Minikube binary
+      shell: |
+        set -e
+        curl -fsSL "https://storage.googleapis.com/minikube/releases/{{ minikube_version }}/minikube-linux-amd64" -o /usr/local/bin/minikube
+        chmod +x /usr/local/bin/minikube
+      args:
+        executable: /bin/bash
+
+    - name: Start Minikube (driver=none, run as root)
+      shell: |
+        set -e
+        minikube start --driver=none {{ kubernetes_version|default('')|ternary('--kubernetes-version='+kubernetes_version, '') }}
+      args:
+        executable: /bin/bash
+
+    - name: Ensure kubeconfig scoped for ubuntu user
+      shell: |
+        mkdir -p /home/ubuntu/.kube
+        cp -f /root/.kube/config /home/ubuntu/.kube/config
+        chown -R ubuntu:ubuntu /home/ubuntu/.kube
+      args:
+        executable: /bin/bash
+
+  handlers:
+    - name: Restart docker
+      service:
+        name: docker
+        state: restarted
