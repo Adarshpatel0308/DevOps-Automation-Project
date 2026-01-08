@@ -1,5 +1,5 @@
 
-name: Bootstrap Jenkins Master
+name: Bootstrap Jenkins Master (SSH, No IAM/SSM)
 on:
   workflow_dispatch: {}
 
@@ -11,11 +11,11 @@ env:
   AWS_REGION: us-east-1
   INSTANCE_TYPE: t3.medium
   SECURITY_GROUP_NAME: jenkins-master-sg
-  KEY_NAME: jenkins-keypair
   AMI_ID: ami-08c40ec9ead489470   # Ubuntu 22.04 LTS (us-east-1)
   JENKINS_PORT: 8080
-  # Optional: set your known VPC to avoid default VPC detection ambiguity
+  # Optional: lock VPC/subnet to your specific IDs
   # VPC_ID: vpc-04e3313d6a32d3ccc
+  # SUBNET_ID: subnet-xxxxxxxx
 
 jobs:
   create-jenkins-master:
@@ -32,42 +32,18 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Ensure or Create Key Pair
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Checking key pair: ${KEY_NAME} in region ${AWS_REGION}"
-          if aws ec2 describe-key-pairs --key-names "${KEY_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1; then
-            echo "Key pair ${KEY_NAME} already exists."
-          else
-            echo "Key pair ${KEY_NAME} not found. Creating..."
-            aws ec2 create-key-pair --key-name "${KEY_NAME}" --region "${AWS_REGION}" \
-              --query 'KeyMaterial' --output text > "${KEY_NAME}.pem"
-            chmod 400 "${KEY_NAME}.pem"
-            echo "Key pair created and saved as ${KEY_NAME}.pem"
-          fi
-
-      - name: Upload Key Pair as Artifact (for SSH later)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: jenkins-keypair-pem
-          path: jenkins-keypair.pem
-          if-no-files-found: ignore
-
       - name: Resolve VPC (default or provided)
-        id: vpc
         shell: bash
         run: |
           set -euo pipefail
           if [[ -n "${VPC_ID:-}" ]]; then
-            VPC="${VPC_ID}"     # ✅ correct variable
+            VPC="${VPC_ID}"
           else
             VPC=$(aws ec2 describe-vpcs \
               --filters "Name=isDefault,Values=true" \
               --query "Vpcs[0].VpcId" --output text --region "${AWS_REGION}")
             if [[ "${VPC}" == "None" || -z "${VPC}" ]]; then
-              echo "ERROR: No default VPC found. Set env VPC_ID to your target VPC."
+              echo "ERROR: No default VPC found. Set env VPC_ID."
               exit 1
             fi
           fi
@@ -82,56 +58,75 @@ jobs:
           REGION="${AWS_REGION}"
           VPC="${VPC}"
 
-          # Find existing SG by name in VPC
           SG_ID=$(aws ec2 describe-security-groups \
             --filters "Name=vpc-id,Values=${VPC}" "Name=group-name,Values=${SG_NAME}" \
             --query "SecurityGroups[0].GroupId" --output text --region "${REGION}" || true)
 
           if [[ -n "${SG_ID}" && "${SG_ID}" != "None" ]]; then
-            echo "Security Group already exists: ${SG_ID}"
+            echo "SG exists: ${SG_ID}"
           else
-            echo "Creating Security Group: ${SG_NAME} in ${VPC}"
             SG_ID=$(aws ec2 create-security-group \
               --group-name "${SG_NAME}" \
               --description "Security group for Jenkins Master" \
               --vpc-id "${VPC}" \
               --query 'GroupId' --output text --region "${REGION}")
-            echo "Created SG: ${SG_ID}"
+            echo "SG created: ${SG_ID}"
           fi
-
           echo "SG_ID=${SG_ID}" >> $GITHUB_ENV
 
-          # Add ingress (duplicate-tolerant). AWS may throw Duplicate; ignore and continue.
+          # Ingress: Jenkins port + SSH (duplicate-tolerant)
+          aws ec2 authorize-security-group-ingress \
+            --group-id "${SG_ID}" --protocol tcp --port "${JENKINS_PORT}" --cidr 0.0.0.0/0 --region "${REGION}" \
+            >/dev/null 2>&1 || echo "Ingress ${JENKINS_PORT}/tcp already present."
           aws ec2 authorize-security-group-ingress \
             --group-id "${SG_ID}" --protocol tcp --port 22 --cidr 0.0.0.0/0 --region "${REGION}" \
             >/dev/null 2>&1 || echo "Ingress 22/tcp already present."
 
-          aws ec2 authorize-security-group-ingress \
-            --group-id "${SG_ID}" --protocol tcp --port "${JENKINS_PORT}" --cidr 0.0.0.0/0 --region "${REGION}" \
-            >/dev/null 2>&1 || echo "Ingress ${JENKINS_PORT}/tcp already present."
-
-      - name: Find a public subnet in VPC (auto)
+      - name: Find a public subnet in VPC
         shell: bash
         run: |
           set -euo pipefail
-          # Pick first subnet with MapPublicIpOnLaunch=true
-          SUBNET_ID=$(aws ec2 describe-subnets \
-            --filters "Name=vpc-id,Values=${VPC}" \
-            --query "Subnets[?MapPublicIpOnLaunch==\`true\`].[SubnetId]" \
-            --output text --region "${AWS_REGION}" | head -n1)
+          if [[ -n "${SUBNET_ID:-}" ]]; then
+            SUBNET="${SUBNET_ID}"
+          else
+            SUBNET=$(aws ec2 describe-subnets \
+              --filters "Name=vpc-id,Values=${VPC}" \
+              --query "Subnets[?MapPublicIpOnLaunch==\`true\`].[SubnetId]" \
+              --output text --region "${AWS_REGION}" | head -n1)
+            if [[ -z "${SUBNET}" || "${SUBNET}" == "None" ]]; then
+              echo "ERROR: No public subnet found in VPC ${VPC}. Set SUBNET_ID."
+              exit 1
+            fi
+          fi
+          echo "SUBNET_ID=${SUBNET}" >> $GITHUB_ENV
+          echo "Using Subnet: ${SUBNET}"
 
-          if [[ -z "${SUBNET_ID}" || "${SUBNET_ID}" == "None" ]]; then
-            echo "ERROR: No public subnet found in VPC ${VPC}. Provide SUBNET_ID env."
+      - name: Create ephemeral key pair (unique per run)
+        shell: bash
+        run: |
+          set -euo pipefail
+          KEY_NAME="jenkins-keypair-${GITHUB_RUN_ID}"
+          echo "KEY_NAME=${KEY_NAME}" >> $GITHUB_ENV
+          aws ec2 create-key-pair --key-name "${KEY_NAME}" --region "${AWS_REGION}" \
+            --query 'KeyMaterial' --output text > "${KEY_NAME}.pem"
+          chmod 400 "${KEY_NAME}.pem"
+          echo "Created PEM: ${KEY_NAME}.pem"
+
+      - name: Upload PEM as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jenkins-keypair-${{ github.run_id }}-pem
+          path: jenkins-keypair-${{ github.run_id }}.pem
+
+      - name: Create Jenkins EC2 (no user-data; SSH will bootstrap)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f "scripts/install-jenkins.sh" ]]; then
+            echo "ERROR: scripts/install-jenkins.sh missing in repo."
             exit 1
           fi
 
-          echo "SUBNET_ID=${SUBNET_ID}" >> $GITHUB_ENV
-          echo "Using Subnet: ${SUBNET_ID}"
-
-      - name: Create Jenkins EC2 Instance
-        shell: bash
-        run: |
-          set -euo pipefail
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id "$AMI_ID" \
             --count 1 \
@@ -140,19 +135,19 @@ jobs:
             --security-group-ids "$SG_ID" \
             --subnet-id "$SUBNET_ID" \
             --associate-public-ip-address \
-            --user-data file://scripts/install-jenkins.sh \
             --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=Jenkins-Master}]' \
             --query 'Instances[0].InstanceId' \
             --output text)
           echo "INSTANCE_ID=${INSTANCE_ID}" >> $GITHUB_ENV
           echo "Created EC2: ${INSTANCE_ID}"
 
-      - name: Wait for EC2 Running State
+      - name: Wait for EC2 running
         shell: bash
         run: |
           set -euo pipefail
           aws ec2 wait instance-running --instance-ids "${INSTANCE_ID}"
-          echo "Instance is running."
+          echo "Instance running. Sleeping 60s..."
+          sleep 60
 
       - name: Get Public IP
         shell: bash
@@ -163,12 +158,56 @@ jobs:
             --query "Reservations[0].Instances[0].PublicIpAddress" \
             --output text)
           echo "PUBLIC_IP=${PUBLIC_IP}" >> $GITHUB_ENV
-          echo "Jenkins URL: http://${PUBLIC_IP}:${JENKINS_PORT}"
+          echo "Public IP: ${PUBLIC_IP}"
+
+      - name: SSH bootstrap installer (retry until SSH ready)
+        shell: bash
+        run: |
+          set -euo pipefail
+          KEY_NAME="${KEY_NAME}"
+          PEM="${KEY_NAME}.pem"
+          HOST="ubuntu@${PUBLIC_IP}"
+          SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
+
+          # Retry loop for SSH availability
+          for i in {1..20}; do
+            echo "Attempt $i: checking SSH..."
+            if ssh ${SSH_OPTS} -i "${PEM}" "${HOST}" "echo SSH OK"; then
+              break
+            fi
+            sleep 10
+          done
+
+          echo "Copying installer..."
+          scp ${SSH_OPTS} -i "${PEM}" scripts/install-jenkins.sh "${HOST}:/home/ubuntu/install-jenkins.sh"
+          echo "Running installer..."
+          ssh ${SSH_OPTS} -i "${PEM}" "${HOST}" "sudo bash /home/ubuntu/install-jenkins.sh"
+
+      - name: Verify Jenkins service & print admin password
+        shell: bash
+        run: |
+          set -euo pipefail
+          PEM="jenkins-keypair-${GITHUB_RUN_ID}.pem"
+          HOST="ubuntu@${PUBLIC_IP}"
+          SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
+          ssh ${SSH_OPTS} -i "${PEM}" "${HOST}" "\
+            sudo systemctl status jenkins --no-pager || true; \
+            sudo journalctl -u jenkins -n 50 --no-pager || true; \
+            test -f /var/lib/jenkins/secrets/initialAdminPassword && sudo cat /var/lib/jenkins/secrets/initialAdminPassword || true \
+          "
+
+      - name: Check Jenkins HTTP reachability
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Trying: http://${PUBLIC_IP}:${JENKINS_PORT}"
+          curl --connect-timeout 10 -I "http://${PUBLIC_IP}:${JENKINS_PORT}" || echo "Reachability check may take another minute."
 
       - name: Output Jenkins URL
         shell: bash
         run: |
           echo "========================================"
-          echo "JENKINS MASTER READY"
+          echo "JENKINS MASTER READY (SSH bootstrapped)"
           echo "URL => http://${PUBLIC_IP}:${JENKINS_PORT}"
+          echo "NOTE: If not reachable, wait ~1-2 minutes and try again."
           echo "========================================"
