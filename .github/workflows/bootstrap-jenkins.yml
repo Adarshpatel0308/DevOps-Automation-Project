@@ -1,8 +1,8 @@
 
-name: Bootstrap Jenkins Master
+# .github/workflows/bootstrap-jenkins.yml
 
-on:
-  workflow_dispatch:
+name: Bootstrap Jenkins Master
+on: { workflow_dispatch: {} }
 
 permissions:
   id-token: write
@@ -13,13 +13,12 @@ env:
   INSTANCE_TYPE: t3.medium
   SECURITY_GROUP_NAME: jenkins-master-sg
   KEY_NAME: jenkins-keypair
-  AMI_ID: ami-08c40ec9ead489470    # Ubuntu 22.04 LTS us-east-1 official AMI
+  AMI_ID: ami-08c40ec9ead489470
   JENKINS_PORT: 8080
 
 jobs:
   create-jenkins-master:
     runs-on: ubuntu-latest
-
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -29,7 +28,30 @@ jobs:
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: us-east-1
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Ensure or Create Key Pair
+      shell: bash
+      run: |
+        set -e
+        echo "Checking key pair: ${KEY_NAME} in region ${AWS_REGION}"
+        if aws ec2 describe-key-pairs --key-names "${KEY_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+          echo "Key pair ${KEY_NAME} already exists."
+        else
+          echo "Key pair ${KEY_NAME} not found. Creating..."
+          aws ec2 create-key-pair --key-name "${KEY_NAME}" --region "${AWS_REGION}" \
+            --query 'KeyMaterial' --output text > "${KEY_NAME}.pem"
+          chmod 400 "${KEY_NAME}.pem"
+          echo "Key pair created and saved as ${KEY_NAME}.pem"
+        fi
+
+    - name: Upload Key Pair as Artifact (for SSH later)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: jenkins-keypair-pem
+        path: jenkins-keypair.pem
+        if-no-files-found: ignore
 
     - name: Create Security Group
       run: |
@@ -37,15 +59,11 @@ jobs:
           --group-name "$SECURITY_GROUP_NAME" \
           --description "Security group for Jenkins Master" \
           --query 'GroupId' --output text)
-
         echo "SG_ID=$SG_ID" >> $GITHUB_ENV
 
-        aws ec2 authorize-security-group-ingress \
-          --group-id "$SG_ID" \
+        aws ec2 authorize-security-group-ingress --group-id "$SG_ID" \
           --protocol tcp --port 22 --cidr 0.0.0.0/0
-
-        aws ec2 authorize-security-group-ingress \
-          --group-id "$SG_ID" \
+        aws ec2 authorize-security-group-ingress --group-id "$SG_ID" \
           --protocol tcp --port $JENKINS_PORT --cidr 0.0.0.0/0
 
     - name: Create Jenkins EC2 Instance
@@ -60,21 +78,17 @@ jobs:
           --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=Jenkins-Master}]' \
           --query 'Instances[0].InstanceId' \
           --output text)
-
         echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
 
     - name: Wait for EC2 Running State
-      run: |
-        aws ec2 wait instance-running --instance-ids $INSTANCE_ID
-        echo "EC2 is running..."
+      run: aws ec2 wait instance-running --instance-ids ${{ env.INSTANCE_ID }}
 
     - name: Get Public IP
       run: |
         PUBLIC_IP=$(aws ec2 describe-instances \
-          --instance-ids $INSTANCE_ID \
+          --instance-ids ${{ env.INSTANCE_ID }} \
           --query "Reservations[0].Instances[0].PublicIpAddress" \
           --output text)
-
         echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
         echo "Jenkins URL: http://$PUBLIC_IP:$JENKINS_PORT"
 
@@ -82,5 +96,5 @@ jobs:
       run: |
         echo "========================================"
         echo "JENKINS MASTER READY"
-        echo "URL => http://${{ env.PUBLIC_IP }}:$JENKINS_PORT"
+        echo "URL => http://${{ env.PUBLIC_IP }}:${{ env.JENKINS_PORT }}"
         echo "========================================"
