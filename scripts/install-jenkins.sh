@@ -5,10 +5,12 @@ export DEBIAN_FRONTEND=noninteractive
 export JENKINS_HOME="/var/lib/jenkins"
 
 # Expect from caller: ADMIN_USER, ADMIN_PASS, REPO_URL, REPO_BRANCH, JOB_NAME, SSH_KEY_PATH
+# Optional: PIM_VER (Plugin Installation Manager version; default set below)
+# Optional: http_proxy / https_proxy (if corporate proxy in path)
 
 # --- Base deps ---
 sudo apt-get update -y
-sudo apt-get install -y ca-certificates curl git unzip gnupg openjdk-17-jre
+sudo apt-get install -y --no-install-recommends ca-certificates curl git unzip gnupg openjdk-17-jre
 
 # --- Jenkins repo + install ---
 sudo install -m 0755 -d /usr/share/keyrings
@@ -27,26 +29,54 @@ sudo sed -i 's/runSetupWizard=true/runSetupWizard=false/' /etc/default/jenkins |
 
 # --- Preinstall required plugins using the Plugin Installation Manager (no HTTP CLI, no docker-only CLI) ---
 # On APT-based Jenkins, 'jenkins-plugin-cli' binary is not available. Use the official Plugin Manager JAR instead.
-# Ref: Plugin Installation Manager Tool (JAR) — resolves dependencies automatically.
+# Ref: https://github.com/jenkinsci/plugin-installation-manager-tool (same engine as jenkins-plugin-cli in Docker) and
+#      https://www.jenkins.io/doc/book/installing/offline/ (recommended for scripted/offline installs)
 sudo systemctl stop jenkins || true
 
-# Try GitHub "latest" release asset first; if it fails, fallback to an explicit version tag.
-# You can override PIM_VER by exporting it in the SSH call (e.g., PIM_VER=2.12.12).
-PIM_VER="${PIM_VER:-2.12.12}"
+PIM_VER="${PIM_VER:-2.12.12}"                  # override via env if you want a different tag
+PIM_TMP="/tmp/jenkins-plugin-manager.jar"
 
-if curl -fL \
-  "https://github.com/jenkinsci/plugin-installation-manager-tool/releases/latest/download/jenkins-plugin-manager.jar" \
-  -o /tmp/jenkins-plugin-manager.jar; then
-  echo "Downloaded Plugin Manager from GitHub (latest)."
-else
-  echo "GitHub latest asset not found, falling back to explicit version v${PIM_VER}..."
-  curl -fL \
-    "https://github.com/jenkinsci/plugin-installation-manager-tool/releases/download/v${PIM_VER}/jenkins-plugin-manager-${PIM_VER}.jar" \
-    -o /tmp/jenkins-plugin-manager.jar
+download_pim() {
+  echo "[PIM] Trying GitHub latest asset..."
+  if curl --retry 6 --retry-connrefused --retry-delay 2 -fL \
+      "https://github.com/jenkinsci/plugin-installation-manager-tool/releases/latest/download/jenkins-plugin-manager.jar" \
+      -o "${PIM_TMP}"; then
+    echo "[PIM] Downloaded from GitHub latest."
+    return 0
+  fi
+
+  echo "[PIM] Latest asset 404; trying explicit version v${PIM_VER}..."
+  if curl --retry 6 --retry-connrefused --retry-delay 2 -fL \
+      "https://github.com/jenkinsci/plugin-installation-manager-tool/releases/download/v${PIM_VER}/jenkins-plugin-manager-${PIM_VER}.jar" \
+      -o "${PIM_TMP}"; then
+    echo "[PIM] Downloaded v${PIM_VER} from GitHub."
+    return 0
+  fi
+
+  echo "[PIM] Falling back to Jenkins CI releases repo (v${PIM_VER})..."
+  curl --retry 6 --retry-connrefused --retry-delay 2 -fL \
+      "https://repo.jenkins-ci.org/releases/io/jenkins/plugin-management/plugin-management-cli/${PIM_VER}/plugin-management-cli-${PIM_VER}.jar" \
+      -o "${PIM_TMP}"
+  echo "[PIM] Downloaded v${PIM_VER} from Jenkins CI releases."
+}
+
+download_pim
+
+# QUICK VALIDATION: size check (avoid accidental HTML/empty file) + help
+if [ ! -s "${PIM_TMP}" ] || [ "$(stat -c%s "${PIM_TMP}")" -lt 1000000 ]; then
+  echo "[PIM] ERROR: Downloaded file seems too small; aborting."
+  ls -l "${PIM_TMP}" || true
+  exit 1
 fi
 
-# Install plugins directly into $JENKINS_HOME/plugins with correct ownership
-sudo -u jenkins java -jar /tmp/jenkins-plugin-manager.jar \
+# Optional sanity: ensure JAR responds to --help
+sudo -u jenkins java -jar "${PIM_TMP}" --help >/dev/null || {
+  echo "[PIM] ERROR: Plugin Manager JAR failed to run --help; aborting."
+  exit 1
+}
+
+# Install plugins (dependencies auto-resolved)
+sudo -u jenkins java -jar "${PIM_TMP}" \
   --war /usr/share/jenkins/jenkins.war \
   --plugin-download-directory /var/lib/jenkins/plugins \
   --plugins \
@@ -127,9 +157,12 @@ def job = instance.getItem(JOB_NAME) as WorkflowJob
 if (job == null) {
   job = instance.createProject(WorkflowJob.class, JOB_NAME)
 }
-def scm = new GitSCM([new UserRemoteConfig(REPO_URL, null, null, null)],
-                     [new BranchSpec("*/" + BRANCH)], false, [], null, null, [])
-def flow = new CpsScmFlowDefinition(scm, "jenkins/Jenkinsfile")
+def scm = new hudson.plugins.git.GitSCM(
+  [new hudson.plugins.git.UserRemoteConfig(REPO_URL, null, null, null)],
+  [new hudson.plugins.git.BranchSpec("*/" + BRANCH)],
+  false, [], null, null, []
+)
+def flow = new org.jenkinsci.plugins.workflow.cps.CpsScmFlowDefinition(scm, "jenkins/Jenkinsfile")
 flow.setLightweight(true)
 job.setDefinition(flow)
 job.save()
@@ -142,3 +175,33 @@ sudo systemctl restart jenkins
 
 # --- Wait again after restart (init.groovy executes here) ---
 for i in {1..30}; do
+  if curl -fsS "http://localhost:8080/login" >/dev/null; then
+    echo "Jenkins HTTP is up after restart."
+    break
+  fi
+  echo "Waiting for Jenkins after init.groovy restart..."
+  sleep 5
+done
+
+# --- Optional: quick auth sanity (no CLI): whoAmI via REST (won't fail the run)
+curl -fsS -u "${ADMIN_USER}:${ADMIN_PASS}" "http://localhost:8080/whoAmI/api/json" || true
+
+# --- Optional: install AWS CLI + kubectl for convenience on master ---
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip -q awscliv2.zip
+sudo ./aws/install
+aws --version || true
+
+KVER="$(curl -L -s https://dl.k8s.io/release/stable.txt)"
+curl -fsSL "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl" -o kubectl
+chmod +x kubectl
+sudo mv kubectl /usr/local/bin/
+kubectl version --client=true || true
+
+# UFW allow 8080 if present
+if command -v ufw >/dev/null 2>&1; then
+  sudo ufw allow 8080/tcp || true
+fi
+
+echo "✅ Jenkins bootstrap complete (wizard disabled, admin+credential+job created, plugins installed via Plugin Manager JAR, pipeline auto-triggered)."
+``
