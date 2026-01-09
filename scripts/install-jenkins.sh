@@ -19,7 +19,20 @@ echo "deb [signed-by=/usr/share/keyrings/jenkins-keyring.gpg] https://pkg.jenkin
 sudo apt-get update -y
 sudo apt-get install -y jenkins
 
-# --- First start (needed so CLI can connect) ---
+# --- Disable setup wizard BEFORE first start (recommended) ---
+# This avoids the unlock flow and makes Groovy init deterministic
+echo "2.0" | sudo tee "${JENKINS_HOME}/jenkins.install.UpgradeWizard.state" >/dev/null
+echo "2.0" | sudo tee "${JENKINS_HOME}/jenkins.install.InstallUtil.lastExecVersion" >/dev/null
+sudo sed -i 's/runSetupWizard=true/runSetupWizard=false/' /etc/default/jenkins || true
+
+# --- Preinstall required plugins using the Plugin Installation Manager (no HTTP CLI) ---
+# This tool ships with official packages/images and resolves dependencies automatically.
+# Ref: https://github.com/jenkinsci/plugin-installation-manager-tool
+sudo systemctl stop jenkins || true
+sudo jenkins-plugin-cli --plugins \
+  git workflow-aggregator credentials credentials-binding ssh-credentials ssh-agent
+
+# --- First start (now that wizard is disabled and plugins are present) ---
 sudo systemctl enable jenkins
 sudo systemctl start jenkins
 
@@ -32,11 +45,6 @@ for i in {1..30}; do
   echo "Waiting for Jenkins HTTP..."
   sleep 5
 done
-
-# --- Disable setup wizard to avoid initialAdminPassword prompt ---
-echo "2.0" | sudo tee "${JENKINS_HOME}/jenkins.install.UpgradeWizard.state" >/dev/null
-echo "2.0" | sudo tee "${JENKINS_HOME}/jenkins.install.InstallUtil.lastExecVersion" >/dev/null
-sudo sed -i 's/runSetupWizard=true/runSetupWizard=false/' /etc/default/jenkins || true
 
 # --- Prepare PEM for Jenkins credential ---
 sudo mkdir -p "${JENKINS_HOME}/keys"
@@ -120,25 +128,8 @@ for i in {1..30}; do
   sleep 5
 done
 
-# --- Download Jenkins CLI jar and install required plugins via CLI ---
-curl -fsSL "http://localhost:8080/jnlpJars/jenkins-cli.jar" -o jenkins-cli.jar
-JAVA_CMD="java -jar jenkins-cli.jar -s http://localhost:8080 -auth ${ADMIN_USER}:${ADMIN_PASS}"
-
-# Install your plugin set (dependencies resolved by Jenkins Update Center)
-$JAVA_CMD install-plugin git workflow-aggregator credentials credentials-binding ssh-credentials ssh-agent
-
-# Safe-restart to load plugins
-$JAVA_CMD safe-restart
-
-# --- Wait for Jenkins after safe-restart ---
-for i in {1..30}; do
-  if curl -fsS "http://localhost:8080/login" >/dev/null; then
-    echo "Jenkins ready with plugins."
-    break
-  fi
-  echo "Waiting after safe-restart..."
-  sleep 5
-done
+# --- Optional: quick auth sanity (no CLI): whoAmI via REST (won't fail the run)
+curl -fsS -u "${ADMIN_USER}:${ADMIN_PASS}" "http://localhost:8080/whoAmI/api/json" || true
 
 # --- Optional: install AWS CLI + kubectl for convenience on master ---
 curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
@@ -157,4 +148,4 @@ if command -v ufw >/dev/null 2>&1; then
   sudo ufw allow 8080/tcp || true
 fi
 
-echo "✅ Jenkins bootstrap complete (wizard disabled, admin+credential+job created, plugins installed via CLI, pipeline auto-triggered)."
+echo "✅ Jenkins bootstrap complete (wizard disabled, admin+credential+job created, plugins installed via jenkins-plugin-cli, pipeline auto-triggered)."
