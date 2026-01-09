@@ -25,12 +25,22 @@ echo "2.0" | sudo tee "${JENKINS_HOME}/jenkins.install.UpgradeWizard.state" >/de
 echo "2.0" | sudo tee "${JENKINS_HOME}/jenkins.install.InstallUtil.lastExecVersion" >/dev/null
 sudo sed -i 's/runSetupWizard=true/runSetupWizard=false/' /etc/default/jenkins || true
 
-# --- Preinstall required plugins using the Plugin Installation Manager (no HTTP CLI) ---
-# This tool ships with official packages/images and resolves dependencies automatically.
-# Ref: https://github.com/jenkinsci/plugin-installation-manager-tool
+# --- Preinstall required plugins using the Plugin Installation Manager (no HTTP CLI, no docker-only CLI) ---
+# On APT-based Jenkins, 'jenkins-plugin-cli' binary is not available. Use the official Plugin Manager JAR instead.
+# Ref: https://github.com/jenkinsci/plugin-installation-manager-tool  (resolves dependencies automatically)
 sudo systemctl stop jenkins || true
-sudo jenkins-plugin-cli --plugins \
-  git workflow-aggregator credentials credentials-binding ssh-credentials ssh-agent
+
+PLUGIN_MGR_URL="https://repo1.maven.org/maven2/io/jenkins/tools/plugin-manager/jenkins-plugin-manager/2.12.16/jenkins-plugin-manager-2.12.16.jar"
+curl -fsSL "$PLUGIN_MGR_URL" -o /tmp/jenkins-plugin-manager.jar
+
+# Install plugins directly into $JENKINS_HOME/plugins with correct ownership
+sudo -u jenkins java -jar /tmp/jenkins-plugin-manager.jar \
+  --war /usr/share/jenkins/jenkins.war \
+  --plugin-download-directory /var/lib/jenkins/plugins \
+  --plugins \
+  git,workflow-aggregator,credentials,credentials-binding,ssh-credentials,ssh-agent
+
+sudo chown -R jenkins:jenkins /var/lib/jenkins/plugins
 
 # --- First start (now that wizard is disabled and plugins are present) ---
 sudo systemctl enable jenkins
@@ -148,4 +158,4 @@ if command -v ufw >/dev/null 2>&1; then
   sudo ufw allow 8080/tcp || true
 fi
 
-echo "✅ Jenkins bootstrap complete (wizard disabled, admin+credential+job created, plugins installed via jenkins-plugin-cli, pipeline auto-triggered)."
+echo "✅ Jenkins bootstrap complete (wizard disabled, admin+credential+job created, plugins installed via Plugin Manager JAR, pipeline auto-triggered)."
