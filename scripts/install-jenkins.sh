@@ -27,18 +27,30 @@ sudo sed -i 's/runSetupWizard=true/runSetupWizard=false/' /etc/default/jenkins |
 
 # --- Preinstall required plugins using the Plugin Installation Manager (no HTTP CLI, no docker-only CLI) ---
 # On APT-based Jenkins, 'jenkins-plugin-cli' binary is not available. Use the official Plugin Manager JAR instead.
-# Ref: https://github.com/jenkinsci/plugin-installation-manager-tool  (resolves dependencies automatically)
+# Ref: Plugin Installation Manager Tool (JAR) — resolves dependencies automatically.
 sudo systemctl stop jenkins || true
 
-PLUGIN_MGR_URL="https://repo1.maven.org/maven2/io/jenkins/tools/plugin-manager/jenkins-plugin-manager/2.12.16/jenkins-plugin-manager-2.12.16.jar"
-curl -fsSL "$PLUGIN_MGR_URL" -o /tmp/jenkins-plugin-manager.jar
+# Try GitHub "latest" release asset first; if it fails, fallback to an explicit version tag.
+# You can override PIM_VER by exporting it in the SSH call (e.g., PIM_VER=2.12.12).
+PIM_VER="${PIM_VER:-2.12.12}"
+
+if curl -fL \
+  "https://github.com/jenkinsci/plugin-installation-manager-tool/releases/latest/download/jenkins-plugin-manager.jar" \
+  -o /tmp/jenkins-plugin-manager.jar; then
+  echo "Downloaded Plugin Manager from GitHub (latest)."
+else
+  echo "GitHub latest asset not found, falling back to explicit version v${PIM_VER}..."
+  curl -fL \
+    "https://github.com/jenkinsci/plugin-installation-manager-tool/releases/download/v${PIM_VER}/jenkins-plugin-manager-${PIM_VER}.jar" \
+    -o /tmp/jenkins-plugin-manager.jar
+fi
 
 # Install plugins directly into $JENKINS_HOME/plugins with correct ownership
 sudo -u jenkins java -jar /tmp/jenkins-plugin-manager.jar \
   --war /usr/share/jenkins/jenkins.war \
   --plugin-download-directory /var/lib/jenkins/plugins \
   --plugins \
-  git,workflow-aggregator,credentials,credentials-binding,ssh-credentials,ssh-agent
+  git workflow-aggregator credentials credentials-binding ssh-credentials ssh-agent
 
 sudo chown -R jenkins:jenkins /var/lib/jenkins/plugins
 
@@ -130,32 +142,3 @@ sudo systemctl restart jenkins
 
 # --- Wait again after restart (init.groovy executes here) ---
 for i in {1..30}; do
-  if curl -fsS "http://localhost:8080/login" >/dev/null; then
-    echo "Jenkins HTTP is up after restart."
-    break
-  fi
-  echo "Waiting for Jenkins after init.groovy restart..."
-  sleep 5
-done
-
-# --- Optional: quick auth sanity (no CLI): whoAmI via REST (won't fail the run)
-curl -fsS -u "${ADMIN_USER}:${ADMIN_PASS}" "http://localhost:8080/whoAmI/api/json" || true
-
-# --- Optional: install AWS CLI + kubectl for convenience on master ---
-curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-unzip -q awscliv2.zip
-sudo ./aws/install
-aws --version || true
-
-KVER="$(curl -L -s https://dl.k8s.io/release/stable.txt)"
-curl -fsSL "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl" -o kubectl
-chmod +x kubectl
-sudo mv kubectl /usr/local/bin/
-kubectl version --client=true || true
-
-# UFW allow 8080 if present
-if command -v ufw >/dev/null 2>&1; then
-  sudo ufw allow 8080/tcp || true
-fi
-
-echo "✅ Jenkins bootstrap complete (wizard disabled, admin+credential+job created, plugins installed via Plugin Manager JAR, pipeline auto-triggered)."
